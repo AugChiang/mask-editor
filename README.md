@@ -3,13 +3,19 @@
 A small Tkinter editor for binary PNG masks. It needs Pillow and a desktop with
 Tk support; it does not depend on Camelia, a model, or a server.
 
-## Install and run
+## Run from a checkout
 
 ```bash
-python -m pip install -e .
-mask-editor --input-dir /path/to/clean-images
-# or: python -m mask_editor --input-dir /path/to/clean-images
+# From the directory containing mask-editor/ (for example, Camelia):
+python ./mask-editor/main.py --input-dir /path/to/clean-images
+# From inside the mask-editor repository:
+python main.py --input-dir /path/to/clean-images
 ```
+
+This entry point works directly in an Anaconda environment without installing the
+package. Pillow and Python's Tk support must be available in that environment.
+Alternatively, `python -m pip install -e .` enables `mask-editor --input-dir ...`
+and `python -m mask_editor --input-dir ...`.
 
 Masks are saved to `<input-dir>/mask/`, preserving nested image paths. For example,
 `<input-dir>/chapter/page.jpg` maps to `<input-dir>/mask/chapter/page.png`. PNG,
