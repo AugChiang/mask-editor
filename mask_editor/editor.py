@@ -13,6 +13,8 @@ import uuid
 
 from PIL import Image, ImageChops, ImageDraw, ImageOps
 
+from .manifest import MaskManifest
+
 
 OVERLAY_COLOR = (255, 64, 160)
 OVERLAY_ALPHA = 100
@@ -95,8 +97,9 @@ class MaskDocument:
     HISTORY_LIMIT = 32
     HISTORY_BYTES = 32 * 1024 * 1024
 
-    def __init__(self, image_path, mask_path):
+    def __init__(self, image_path, mask_path, manifest=None):
         self.image_path, self.mask_path = Path(image_path), Path(mask_path)
+        self.manifest = manifest
         if self.image_path.resolve() == self.mask_path.resolve():
             raise ValueError("The mask path must not replace the original image")
         with Image.open(self.image_path) as image:
@@ -156,11 +159,16 @@ class MaskDocument:
             self.mask = ImageChops.subtract(self.mask, self._erase_mask)
 
     def _load_shapes(self):
-        if not self.metadata_path.is_file():
-            return
         original_mask = self._base_mask.copy()
         try:
-            data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            if self.manifest is None:
+                if not self.metadata_path.is_file():
+                    return
+                data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            else:
+                data = self.manifest.state_for(self.image_path)
+                if data is None:
+                    return
             if data["version"] not in (1, 2):
                 return
             if data["mask_sha256"] != hashlib.sha256(self._base_mask.tobytes()).hexdigest():
@@ -282,6 +290,7 @@ class MaskDocument:
         finally:
             if temporary.exists():
                 temporary.unlink()
+        data = None
         if self.rectangles or self._erase_mask.getbbox():
             base_buffer, erase_buffer = io.BytesIO(), io.BytesIO()
             self._base_mask.save(base_buffer, format="PNG")
@@ -291,6 +300,11 @@ class MaskDocument:
                     "base_png": base64.b64encode(base_buffer.getvalue()).decode("ascii"),
                     "erase_png": base64.b64encode(erase_buffer.getvalue()).decode("ascii"),
                     "rectangles": [asdict(rectangle) for rectangle in self.rectangles]}
+        if self.manifest is not None:
+            self.manifest.record(self.image_path, data)
+            if self.metadata_path.exists():
+                self.metadata_path.unlink()
+        elif data is not None:
             metadata_temp = self.metadata_path.with_name(
                 f".{self.metadata_path.name}.{uuid.uuid4().hex}.tmp")
             try:
@@ -314,15 +328,16 @@ class MaskDocument:
 
 
 class MaskEditor:
-    def __init__(self, root, image_dir, mask_dir):
+    def __init__(self, root, image_dir, mask_dir, manifest=None):
         import tkinter as tk
         from tkinter import messagebox, ttk
 
         self.root, self.tk, self.messagebox = root, tk, messagebox
         self.images = Path(image_dir).resolve()
         self.pages = editor_pages(self.images, mask_dir)
+        self.manifest = manifest or MaskManifest(self.images, mask_dir, self.pages)
         self.index = 0
-        self.document = MaskDocument(*self.pages[0])
+        self.document = MaskDocument(*self.pages[0], manifest=self.manifest)
         self.scale = 1.0
         self._last_point = None
         self._erase_stroke = False
@@ -723,7 +738,7 @@ class MaskEditor:
             self.page_choice.current(self.index)
             return
         try:
-            document = MaskDocument(*self.pages[index])
+            document = MaskDocument(*self.pages[index], manifest=self.manifest)
         except (OSError, ValueError) as exc:
             self.messagebox.showerror("Could not load page", str(exc), parent=self.root)
             self.page_choice.current(self.index)
@@ -856,7 +871,8 @@ class MaskEditor:
 
 
 def launch_editor(image_dir, mask_dir):
-    editor_pages(image_dir, mask_dir)  # Validate before creating a window.
+    pages = editor_pages(image_dir, mask_dir)  # Validate before creating a window.
+    manifest = MaskManifest(image_dir, mask_dir, pages)
     try:
         import tkinter as tk
     except ImportError as exc:
@@ -866,7 +882,7 @@ def launch_editor(image_dir, mask_dir):
     except tk.TclError as exc:
         raise RuntimeError("Could not open the mask editor. A desktop display and Tk support are required.") from exc
     try:
-        MaskEditor(root, image_dir, mask_dir)
+        MaskEditor(root, image_dir, mask_dir, manifest=manifest)
         root.mainloop()
     finally:
         try:

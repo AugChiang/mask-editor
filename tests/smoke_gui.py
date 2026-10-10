@@ -68,7 +68,9 @@ def main():
             editor.render()
             editor.save()
             assert (masks / "page.png").is_file()
-            reopened = MaskDocument(image_path, masks / "page.png")
+            assert (masks / "mask-editor.json").is_file()
+            assert len(list(masks.rglob("*.json"))) == 1
+            reopened = MaskDocument(image_path, masks / "page.png", manifest=editor.manifest)
             assert len(reopened.rectangles) == 2
             assert reopened.mask.getpixel(erased) == 0
         finally:

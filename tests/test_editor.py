@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from mask_editor import MaskDocument, MaskEditor, Rectangle, editor_pages
+from mask_editor import MaskDocument, MaskEditor, MaskManifest, Rectangle, __version__, editor_pages
 from mask_editor.__main__ import main
 
 
@@ -63,6 +63,16 @@ class EditorTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as exit_context:
             main([str(self.images / "missing"), str(self.masks)])
         self.assertEqual(exit_context.exception.code, 1)
+
+    def test_cli_creates_manifest_before_opening_window(self):
+        import tkinter
+
+        with patch("tkinter.Tk", side_effect=tkinter.TclError("no display")):
+            with self.assertRaises(SystemExit) as exit_context:
+                main(["--input-dir", str(self.images), "--mask-dir", str(self.masks)])
+        self.assertEqual(exit_context.exception.code, 1)
+        data = json.loads((self.masks / "mask-editor.json").read_text(encoding="utf-8"))
+        self.assertEqual(data["images"][0]["origin-img"], "chapter/page.png")
 
     def test_input_dir_uses_nested_mask_output_and_does_not_scan_it_as_input(self):
         output = self.images / "mask"
@@ -157,6 +167,51 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(reopened.rectangles), 1)
         self.assertEqual(reopened.rectangles[0].angle, 30)
         self.assertEqual(reopened.mask.tobytes(), document.mask.tobytes())
+
+    def test_one_manifest_lists_all_images_and_preserves_editable_masks(self):
+        second_image = self.images / "chapter" / "second.jpg"
+        Image.new("RGB", (12, 16), "white").save(second_image)
+        pages = editor_pages(self.images, self.masks)
+        manifest = MaskManifest(self.images, self.masks, pages)
+        data = json.loads(manifest.path.read_text(encoding="utf-8"))
+        self.assertEqual(data["mask_editor_version"], __version__)
+        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual([item["origin-img"] for item in data["images"]],
+                         ["chapter/page.png", "chapter/second.jpg"])
+        self.assertEqual(data["images"][1],
+                         {"origin-img": "chapter/second.jpg", "mask": "chapter/second.png",
+                          "width": 12, "height": 16, "saved": False})
+
+        document = MaskDocument(self.image_path, self.mask_path, manifest=manifest)
+        document.add_rectangle(Rectangle(12, 10, 14, 12, 30))
+        document.end_stroke()
+        document.brush((12, 10), (12, 10), 3, erase=True)
+        document.end_stroke()
+        document.save()
+        self.assertFalse(document.metadata_path.exists())
+        self.assertEqual(list(self.masks.rglob("*.json")), [manifest.path])
+        data = json.loads(manifest.path.read_text(encoding="utf-8"))
+        page = data["images"][0]
+        self.assertTrue(page["saved"])
+        self.assertEqual(page["mask"], "chapter/page.png")
+        self.assertEqual(page["editor_state"]["rectangles"][0]["angle"], 30)
+        reopened_manifest = MaskManifest(self.images, self.masks, pages)
+        reopened = MaskDocument(self.image_path, self.mask_path, manifest=reopened_manifest)
+        self.assertEqual(reopened.mask.tobytes(), document.mask.tobytes())
+        self.assertEqual(len(reopened.rectangles), 1)
+        self.assertEqual(reopened.mask.getpixel((12, 10)), 0)
+
+    def test_manifest_migrates_legacy_sidecar(self):
+        legacy = MaskDocument(self.image_path, self.mask_path)
+        legacy.add_rectangle(Rectangle(12, 10, 8, 6, 45))
+        legacy.save()
+        self.assertTrue(legacy.metadata_path.exists())
+        manifest = MaskManifest(self.images, self.masks, editor_pages(self.images, self.masks))
+        self.assertFalse(legacy.metadata_path.exists())
+        self.assertEqual(len(list(self.masks.rglob("*.json"))), 1)
+        reopened = MaskDocument(self.image_path, self.mask_path, manifest=manifest)
+        self.assertEqual(reopened.rectangles[0].angle, 45)
+        self.assertEqual(reopened.mask.tobytes(), legacy.mask.tobytes())
 
     def test_erasing_empty_image_does_not_hide_a_later_rectangle(self):
         document = MaskDocument(self.image_path, self.mask_path)

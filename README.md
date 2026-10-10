@@ -35,17 +35,43 @@ mouse dragging to navigate. Ctrl+S saves, Ctrl+Z undoes, and Ctrl+Y redoes. The
 editor asks about unsaved changes when changing pages or closing.
 The **Erase** brush and right-button dragging also remove parts of rectangle masks.
 Switch back to **Paint** to restore erased pixels. Erased areas remain editable
-after saving and reopening; they are kept with the rectangle data in the sidecar.
+after saving and reopening; they are kept with the rectangle data in the manifest.
 
 Select **Rectangle** and drag on the image to draw a masked rectangle. Drag inside
 it to move it, drag a corner to change its width and height, or drag the circle
 above it to rotate it. **Add rectangle** inserts one in the image center;
 **Delete rectangle** or the Delete key removes the selected one. The mask PNG
 contains the actual rotated rectangle pixels, with no outline or handles. A
-`*.mask-editor.json` sidecar keeps rectangles editable after reopening the image;
-other tools can use the PNG alone. Brush strokes and rectangles are combined in
-the saved mask. The `[` and `]` keys rotate the selected rectangle by 15 degrees
-when its circle is hard to reach.
+single `<mask-dir>/mask-editor.json` manifest lists every source image and its
+mask, the editor version, image dimensions, and whether its mask has been saved.
+It also keeps rectangles and erasures editable after reopening. Existing
+per-mask JSON sidecars are moved into this manifest when the editor starts.
+Other tools can use the PNG masks alone. Brush strokes and rectangles are
+combined in the saved mask. The `[` and `]` keys rotate the selected rectangle
+by 15 degrees when its circle is hard to reach.
+
+For example, an entry in the manifest looks like this (paths are relative to
+their respective input and mask directories):
+
+```json
+{
+  "schema_version": 1,
+  "mask_editor_version": "0.1.0",
+  "images": [
+    {
+      "origin-img": "chapter/page.jpg",
+      "mask": "chapter/page.png",
+      "width": 1280,
+      "height": 960,
+      "saved": false
+    }
+  ]
+}
+```
+
+Saving a page changes `saved` to `true`. Pages with editable rectangles or
+erasures also have an `editor_state` object in their entry.
+
 Press **Ctrl+C** to copy the selected rectangle and **Ctrl+V** to paste an
 editable duplicate with the same width, height, and rotation. Pasting on the
 same image offsets the duplicate by 16 pixels so it is visible; pasting on a
