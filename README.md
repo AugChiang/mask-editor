@@ -7,12 +7,17 @@ Tk support; it does not depend on Camelia, a model, or a server.
 
 ```bash
 python -m pip install -e .
-mask-editor /path/to/images /path/to/masks
-# or: python -m mask_editor /path/to/images /path/to/masks
+mask-editor --input-dir /path/to/clean-images
+# or: python -m mask_editor --input-dir /path/to/clean-images
 ```
 
-Both directories may contain nested folders. For each PNG in `images`, the editor
-uses the matching relative path under `masks`. Missing masks start blank. Source
+Masks are saved to `<input-dir>/mask/`, preserving nested image paths. For example,
+`<input-dir>/chapter/page.jpg` maps to `<input-dir>/mask/chapter/page.png`. PNG,
+JPEG, WebP, BMP, and TIFF source images are supported. Inputs whose names differ
+only by extension and would map to one mask are rejected. The
+mask output folder is excluded when finding source images. Pass `--mask-dir PATH`
+to use a different mask location. The older positional form
+`mask-editor IMAGES MASKS` also works. Missing masks start blank. Source
 images are never overwritten. Saved masks are grayscale PNGs at the source image's
 full resolution, containing only 0 (keep) and 255 (selected). Existing masks must
 have the same dimensions as their source images. The magenta overlay is for display
@@ -23,12 +28,22 @@ Use the brush slider, Undo/Redo, Clear mask, zoom controls, scrollbars, and midd
 mouse dragging to navigate. Ctrl+S saves, Ctrl+Z undoes, and Ctrl+Y redoes. The
 editor asks about unsaved changes when changing pages or closing.
 
+Select **Rectangle** and drag on the image to draw a masked rectangle. Drag inside
+it to move it, drag a corner to change its width and height, or drag the circle
+above it to rotate it. **Add rectangle** inserts one in the image center;
+**Delete rectangle** or the Delete key removes the selected one. The mask PNG
+contains the actual rotated rectangle pixels, with no outline or handles. A
+`*.mask-editor.json` sidecar keeps rectangles editable after reopening the image;
+other tools can use the PNG alone. Brush strokes and rectangles are combined in
+the saved mask. The `[` and `]` keys rotate the selected rectangle by 15 degrees
+when its circle is hard to reach.
+
 ## Use from Python
 
 ```python
-from mask_editor import launch_editor, MaskDocument, editor_pages
+from mask_editor import launch_editor, MaskDocument, Rectangle, editor_pages
 
-launch_editor("images", "masks")
+launch_editor("images", "images/mask")
 ```
 
 `editor_pages(image_dir, mask_dir)` returns source/mask path pairs. `MaskDocument`
@@ -45,3 +60,4 @@ python -m pip install -e ./mask-editor
 Initialize it after cloning a parent repository with `git submodule update --init`.
 Run its tests with `python -m unittest discover -s mask-editor/tests -v` from the
 parent directory, or `python -m unittest discover -s tests -v` from this repository.
+An optional real-Tk check is `python tests/smoke_gui.py` from this repository.

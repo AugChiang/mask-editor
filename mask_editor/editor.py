@@ -1,7 +1,11 @@
 """Desktop editor for full-resolution binary PNG masks."""
 
 from collections import deque
+from dataclasses import asdict, dataclass, replace
+import base64
+import hashlib
 import io
+import json
 import math
 from pathlib import Path
 import uuid
@@ -11,19 +15,77 @@ from PIL import Image, ImageDraw, ImageOps
 
 OVERLAY_COLOR = (255, 64, 160)
 OVERLAY_ALPHA = 100
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 
 
 def editor_pages(image_dir, mask_dir):
     images, masks = Path(image_dir).resolve(), Path(mask_dir).resolve()
-    if images == masks or images in masks.parents or masks in images.parents:
-        raise ValueError("Image and mask directories must not overlap")
+    if images == masks or masks in images.parents:
+        raise ValueError("Image and mask directories must not overlap in this direction")
     if not images.is_dir():
         raise ValueError(f"Image directory does not exist: {images}")
-    pages = [(path, masks / path.relative_to(images))
-             for path in sorted(images.rglob("*")) if path.is_file() and path.suffix.lower() == ".png"]
+    pages, outputs = [], {}
+    for path in sorted(images.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS or masks in path.parents:
+            continue
+        mask = masks / path.relative_to(images).with_suffix(".png")
+        if mask in outputs:
+            raise ValueError(f"Images {outputs[mask]} and {path} map to the same mask: {mask}")
+        outputs[mask] = path
+        pages.append((path, mask))
     if not pages:
-        raise ValueError(f"No PNG images found in {images}")
+        raise ValueError(f"No supported images found in {images}")
     return pages
+
+
+@dataclass
+class Rectangle:
+    """A rectangle in source-image coordinates, rotated clockwise in screen space."""
+
+    cx: float
+    cy: float
+    width: float
+    height: float
+    angle: float = 0.0
+
+    def __post_init__(self):
+        if (not all(math.isfinite(value) for value in asdict(self).values())
+                or self.width <= 0 or self.height <= 0):
+            raise ValueError("Rectangle dimensions must be positive and all values finite")
+
+    def corners(self):
+        cosine, sine = math.cos(math.radians(self.angle)), math.sin(math.radians(self.angle))
+        return [(self.cx + x * cosine - y * sine, self.cy + x * sine + y * cosine)
+                for x, y in ((-self.width / 2, -self.height / 2),
+                             (self.width / 2, -self.height / 2),
+                             (self.width / 2, self.height / 2),
+                             (-self.width / 2, self.height / 2))]
+
+    def contains(self, point):
+        x, y = point[0] - self.cx, point[1] - self.cy
+        cosine, sine = math.cos(math.radians(self.angle)), math.sin(math.radians(self.angle))
+        return (abs(x * cosine + y * sine) <= self.width / 2
+                and abs(-x * sine + y * cosine) <= self.height / 2)
+
+    def rotation_handle(self, distance):
+        a, b = self.corners()[:2]
+        angle = math.radians(self.angle)
+        return ((a[0] + b[0]) / 2 + math.sin(angle) * distance,
+                (a[1] + b[1]) / 2 - math.cos(angle) * distance)
+
+    def resize_from_corner(self, corner, point):
+        """Keep the opposite corner fixed while dragging one corner."""
+        anchor = self.corners()[(corner + 2) % 4]
+        dx, dy = point[0] - anchor[0], point[1] - anchor[1]
+        cosine, sine = math.cos(math.radians(self.angle)), math.sin(math.radians(self.angle))
+        local_x, local_y = dx * cosine + dy * sine, -dx * sine + dy * cosine
+        sign_x = -1 if corner in (0, 3) else 1
+        sign_y = -1 if corner in (0, 1) else 1
+        self.width = max(1.0, sign_x * local_x)
+        self.height = max(1.0, sign_y * local_y)
+        half_x, half_y = sign_x * self.width / 2, sign_y * self.height / 2
+        self.cx = anchor[0] + half_x * cosine - half_y * sine
+        self.cy = anchor[1] + half_x * sine + half_y * cosine
 
 
 class MaskDocument:
@@ -38,14 +100,18 @@ class MaskDocument:
             raise ValueError("The mask path must not replace the original image")
         with Image.open(self.image_path) as image:
             self.image = ImageOps.exif_transpose(image).convert("RGB")
+        self.rectangles = []
         if self.mask_path.exists():
             with Image.open(self.mask_path) as mask:
                 if mask.size != self.image.size:
                     raise ValueError(f"Mask size {mask.size} must match image size {self.image.size}: {self.mask_path}")
-                self.mask = mask.convert("L").point(lambda value: 255 if value >= 128 else 0)
+                self._base_mask = mask.convert("L").point(lambda value: 255 if value >= 128 else 0)
+            self._load_shapes()
+            self._recompose()
             self._saved = self._snapshot()
         else:
-            self.mask = Image.new("L", self.image.size, 0)
+            self._base_mask = Image.new("L", self.image.size, 0)
+            self._recompose()
             self._saved = None
         self.dirty = self._saved is None
         self.undo_history, self.redo_history = deque(), deque()
@@ -53,18 +119,57 @@ class MaskDocument:
 
     def _snapshot(self):
         buffer = io.BytesIO()
-        self.mask.save(buffer, format="PNG", compress_level=1)
-        return buffer.getvalue()
+        self._base_mask.save(buffer, format="PNG", compress_level=1)
+        return buffer.getvalue(), tuple((r.cx, r.cy, r.width, r.height, r.angle)
+                                      for r in self.rectangles)
 
     def _restore(self, snapshot):
-        with Image.open(io.BytesIO(snapshot)) as mask:
-            self.mask = mask.copy()
+        mask_png, rectangles = snapshot
+        with Image.open(io.BytesIO(mask_png)) as mask:
+            self._base_mask = mask.copy()
+        self.rectangles = [Rectangle(*values) for values in rectangles]
+        self._recompose()
         self.dirty = snapshot != self._saved
 
     def _remember(self, history, snapshot):
         history.append(snapshot)
-        while len(history) > self.HISTORY_LIMIT or sum(map(len, history)) > self.HISTORY_BYTES:
+        while (len(history) > self.HISTORY_LIMIT
+               or sum(len(item[0]) + 40 * len(item[1]) for item in history) > self.HISTORY_BYTES):
             history.popleft()
+
+    @property
+    def metadata_path(self):
+        return self.mask_path.with_name(self.mask_path.stem + ".mask-editor.json")
+
+    def _recompose(self):
+        self.mask = self._base_mask.copy()
+        draw = ImageDraw.Draw(self.mask)
+        for rectangle in self.rectangles:
+            draw.polygon(rectangle.corners(), fill=255)
+
+    def _load_shapes(self):
+        if not self.metadata_path.is_file():
+            return
+        original_mask = self._base_mask.copy()
+        try:
+            data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+            if data["version"] != 1:
+                return
+            if data["mask_sha256"] != hashlib.sha256(self._base_mask.tobytes()).hexdigest():
+                return  # The PNG was edited outside this editor; keep that PNG authoritative.
+            with Image.open(io.BytesIO(base64.b64decode(data["base_png"], validate=True))) as base:
+                if base.size != self.image.size or base.mode != "L":
+                    return
+                rectangles = [Rectangle(**values) for values in data["rectangles"]]
+                self._base_mask = base.point(lambda value: 255 if value >= 128 else 0)
+                self.rectangles = rectangles
+            self._recompose()
+            if hashlib.sha256(self.mask.tobytes()).hexdigest() != data["mask_sha256"]:
+                self._base_mask = original_mask
+                self.rectangles = []
+        except (OSError, ValueError, KeyError, TypeError):
+            self._base_mask = original_mask
+            self.rectangles = []
 
     def begin_stroke(self):
         if self._stroke_before is None:
@@ -74,7 +179,7 @@ class MaskDocument:
         diameter = max(1, int(diameter))
         self.begin_stroke()
         value = 0 if erase else 255
-        draw = ImageDraw.Draw(self.mask)
+        draw = ImageDraw.Draw(self._base_mask)
         points = [(math.floor(x), math.floor(y)) for x, y in (start, end)]
         draw.line(points, fill=value, width=diameter)
         for x, y in points:
@@ -84,7 +189,27 @@ class MaskDocument:
                 left = x - diameter // 2
                 top = y - diameter // 2
                 draw.ellipse((left, top, left + diameter - 1, top + diameter - 1), fill=value)
+        self._recompose()
         self.dirty = True
+
+    def add_rectangle(self, rectangle):
+        self.begin_stroke()
+        self.rectangles.append(rectangle)
+        self._recompose()
+        self.dirty = True
+        return len(self.rectangles) - 1
+
+    def update_rectangle(self, index, rectangle):
+        self.begin_stroke()
+        self.rectangles[index] = rectangle
+        self._recompose()
+        self.dirty = True
+
+    def remove_rectangle(self, index):
+        self.begin_stroke()
+        del self.rectangles[index]
+        self._recompose()
+        self.end_stroke()
 
     def end_stroke(self):
         if self._stroke_before is None:
@@ -110,7 +235,9 @@ class MaskDocument:
 
     def clear(self):
         self.begin_stroke()
-        self.mask.paste(0, (0, 0, *self.mask.size))
+        self._base_mask.paste(0, (0, 0, *self._base_mask.size))
+        self.rectangles.clear()
+        self._recompose()
         self.end_stroke()
 
     def save(self):
@@ -123,6 +250,23 @@ class MaskDocument:
         finally:
             if temporary.exists():
                 temporary.unlink()
+        if self.rectangles:
+            buffer = io.BytesIO()
+            self._base_mask.save(buffer, format="PNG")
+            data = {"version": 1,
+                    "mask_sha256": hashlib.sha256(self.mask.tobytes()).hexdigest(),
+                    "base_png": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                    "rectangles": [asdict(rectangle) for rectangle in self.rectangles]}
+            metadata_temp = self.metadata_path.with_name(
+                f".{self.metadata_path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                metadata_temp.write_text(json.dumps(data), encoding="utf-8")
+                metadata_temp.replace(self.metadata_path)
+            finally:
+                if metadata_temp.exists():
+                    metadata_temp.unlink()
+        elif self.metadata_path.exists():
+            self.metadata_path.unlink()
         self._saved = self._snapshot()
         self.dirty = False
 
@@ -152,6 +296,11 @@ class MaskEditor:
         self._photo = None
         self._fitted = False
         self._cursor_position = None
+        self.selected_rectangle = None
+        self._shape_action = None
+        self._shape_start = None
+        self._shape_original = None
+        self._rotation_offset = 0
         root.title("Mask editor")
         root.geometry("1100x820")
         root.minsize(720, 480)
@@ -174,8 +323,14 @@ class MaskEditor:
         tools = ttk.Frame(root, padding=(8, 0, 8, 8))
         tools.pack(fill="x")
         self.tool = tk.StringVar(value="paint")
-        ttk.Radiobutton(tools, text="Paint", variable=self.tool, value="paint").pack(side="left")
-        ttk.Radiobutton(tools, text="Erase", variable=self.tool, value="erase").pack(side="left", padx=4)
+        ttk.Radiobutton(tools, text="Paint", variable=self.tool, value="paint",
+                        command=self.tool_changed).pack(side="left")
+        ttk.Radiobutton(tools, text="Erase", variable=self.tool, value="erase",
+                        command=self.tool_changed).pack(side="left", padx=4)
+        ttk.Radiobutton(tools, text="Rectangle", variable=self.tool, value="rectangle",
+                        command=self.tool_changed).pack(side="left", padx=4)
+        ttk.Button(tools, text="Add rectangle", command=self.add_rectangle).pack(side="left", padx=(8, 0))
+        ttk.Button(tools, text="Delete rectangle", command=self.delete_rectangle).pack(side="left", padx=4)
         self.brush_size = tk.IntVar(value=24)
         self.brush_label = tk.StringVar(value="Brush: 24 px")
         ttk.Label(tools, textvariable=self.brush_label).pack(side="left", padx=(12, 4))
@@ -194,7 +349,7 @@ class MaskEditor:
         ttk.Button(view_tools, text="100%", command=lambda: self.set_zoom(1.0)).pack(side="left", padx=4)
         self.zoom_label = tk.StringVar()
         ttk.Label(view_tools, textvariable=self.zoom_label).pack(side="left", padx=8)
-        ttk.Label(view_tools, text="Magenta = inpaint | right-drag = erase | middle-drag = pan | Ctrl+S = save").pack(side="left")
+        ttk.Label(view_tools, text="Rectangle: drag to draw, drag corners to resize, circle to rotate | Ctrl+S = save").pack(side="left")
 
         viewport = ttk.Frame(root)
         viewport.pack(fill="both", expand=True)
@@ -228,6 +383,9 @@ class MaskEditor:
         self.canvas.bind("<B2-Motion>", self.pan)
         for key, action in (("<Control-s>", self.save), ("<Control-z>", self.undo), ("<Control-y>", self.redo)):
             root.bind(key, lambda event, action=action: self.shortcut(action))
+        root.bind("<Delete>", lambda event: self.shortcut(self.delete_rectangle))
+        root.bind("<bracketleft>", lambda event: self.shortcut(lambda: self.rotate_selected(-15)))
+        root.bind("<bracketright>", lambda event: self.shortcut(lambda: self.rotate_selected(15)))
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, padding=8).pack(fill="x")
         self.update_status()
@@ -252,11 +410,19 @@ class MaskEditor:
         if hasattr(self, "canvas"):
             self.update_cursor()
 
+    def tool_changed(self):
+        self.release()
+        self.update_cursor()
+        self.schedule_render()
+
     def point(self, event):
-        x, y = self.canvas.canvasx(event.x) / self.scale, self.canvas.canvasy(event.y) / self.scale
+        x, y = self.image_point(event)
         if 0 <= x < self.document.image.width and 0 <= y < self.document.image.height:
             return x, y
         return None
+
+    def image_point(self, event):
+        return self.canvas.canvasx(event.x) / self.scale, self.canvas.canvasy(event.y) / self.scale
 
     def move_cursor(self, event):
         self._cursor_position = event.x, event.y
@@ -267,7 +433,7 @@ class MaskEditor:
         self.update_cursor()
 
     def update_cursor(self):
-        if self._cursor_position is None:
+        if self._cursor_position is None or self.tool.get() == "rectangle":
             self.canvas.itemconfigure(self._cursor_halo, state="hidden")
             self.canvas.itemconfigure(self._cursor_item, state="hidden")
             self.canvas.configure(cursor="arrow")
@@ -292,6 +458,10 @@ class MaskEditor:
     def press(self, event, erase=False):
         self.release()
         self.canvas.focus_set()
+        if self.tool.get() == "rectangle" and not erase:
+            self.press_rectangle(event)
+            self.move_cursor(event)
+            return
         self._last_point = self.point(event)
         self._erase_stroke = erase or self.tool.get() == "erase"
         if self._last_point is not None:
@@ -301,6 +471,10 @@ class MaskEditor:
         self.move_cursor(event)
 
     def drag(self, event):
+        if self._shape_action is not None:
+            self.drag_rectangle(event)
+            self.move_cursor(event)
+            return
         point = self.point(event)
         if point is not None:
             self.document.brush(self._last_point or point, point, self.brush_size.get(), self._erase_stroke)
@@ -309,27 +483,145 @@ class MaskEditor:
         self.move_cursor(event)
 
     def release(self, event=None):
+        if self._shape_action is not None:
+            if event is not None:
+                self.drag_rectangle(event)
+            self.document.end_stroke()
+            self._shape_action = None
+            self._shape_original = None
+            self.update_status()
+            self.schedule_render()
+            return
         if event is not None and self._last_point is not None:
             self.drag(event)
         self.document.end_stroke()
         self._last_point = None
         self.update_status()
 
+    def add_rectangle(self):
+        self.release()
+        width, height = self.document.image.size
+        rectangle = Rectangle(width / 2, height / 2, max(1, width / 4), max(1, height / 4))
+        self.selected_rectangle = self.document.add_rectangle(rectangle)
+        self.document.end_stroke()
+        self.tool.set("rectangle")
+        self.tool_changed()
+        self.update_status()
+        self.schedule_render()
+
+    def delete_rectangle(self):
+        self.release()
+        if self.tool.get() != "rectangle" or self.selected_rectangle is None:
+            return
+        if self.selected_rectangle < len(self.document.rectangles):
+            self.document.remove_rectangle(self.selected_rectangle)
+        self.selected_rectangle = None
+        self.update_status()
+        self.schedule_render()
+
+    def rotate_selected(self, degrees):
+        self.release()
+        if self.tool.get() != "rectangle" or self.selected_rectangle is None:
+            return
+        if self.selected_rectangle >= len(self.document.rectangles):
+            return
+        rectangle = replace(self.document.rectangles[self.selected_rectangle])
+        rectangle.angle = (rectangle.angle + degrees) % 360
+        self.document.update_rectangle(self.selected_rectangle, rectangle)
+        self.document.end_stroke()
+        self.update_status()
+        self.schedule_render()
+
+    def rotation_handle(self, rectangle):
+        """Choose a reachable rotation handle near the top or bottom edge."""
+        distance = min(28 / self.scale, min(self.document.image.size) / 4)
+        corners = rectangle.corners()
+        options = ((rectangle.rotation_handle(distance),
+                    ((corners[0][0] + corners[1][0]) / 2,
+                     (corners[0][1] + corners[1][1]) / 2)),
+                   (rectangle.rotation_handle(-rectangle.height - distance),
+                    ((corners[2][0] + corners[3][0]) / 2,
+                     (corners[2][1] + corners[3][1]) / 2)))
+        for point, anchor in options:
+            if 0 <= point[0] < self.document.image.width and 0 <= point[1] < self.document.image.height:
+                return point, anchor
+        return options[0]
+
+    def press_rectangle(self, event):
+        point = self.image_point(event)
+        handle_radius = 9 / self.scale
+        index = self.selected_rectangle
+        if index is not None and index < len(self.document.rectangles):
+            rectangle = self.document.rectangles[index]
+            if math.dist(point, self.rotation_handle(rectangle)[0]) <= handle_radius:
+                self._shape_action = "rotate"
+                self._rotation_offset = (rectangle.angle - math.degrees(
+                    math.atan2(point[1] - rectangle.cy, point[0] - rectangle.cx)))
+            else:
+                corners = rectangle.corners()
+                corner = min(range(4), key=lambda i: math.dist(point, corners[i]))
+                distance = math.dist(point, corners[corner])
+                if (distance <= handle_radius
+                        and distance <= math.dist(point, (rectangle.cx, rectangle.cy))):
+                    self._shape_action = ("resize", corner)
+        if self._shape_action is None:
+            for index in range(len(self.document.rectangles) - 1, -1, -1):
+                if self.document.rectangles[index].contains(point):
+                    self.selected_rectangle = index
+                    self._shape_action = "move"
+                    break
+        if self._shape_action is None:
+            if self.point(event) is None:
+                self.selected_rectangle = None
+                self.schedule_render()
+                return
+            self.selected_rectangle = self.document.add_rectangle(Rectangle(*point, 1, 1))
+            self._shape_action = "create"
+        self._shape_start = point
+        self._shape_original = replace(self.document.rectangles[self.selected_rectangle])
+        self.document.begin_stroke()
+        self.schedule_render()
+
+    def drag_rectangle(self, event):
+        point = self.image_point(event)
+        original = self._shape_original
+        rectangle = replace(original)
+        if self._shape_action == "create":
+            rectangle.cx = (self._shape_start[0] + point[0]) / 2
+            rectangle.cy = (self._shape_start[1] + point[1]) / 2
+            rectangle.width = max(1, abs(point[0] - self._shape_start[0]))
+            rectangle.height = max(1, abs(point[1] - self._shape_start[1]))
+        elif self._shape_action == "move":
+            rectangle.cx += point[0] - self._shape_start[0]
+            rectangle.cy += point[1] - self._shape_start[1]
+        elif self._shape_action == "rotate":
+            rectangle.angle = (math.degrees(math.atan2(point[1] - rectangle.cy,
+                                                       point[0] - rectangle.cx))
+                               + self._rotation_offset) % 360
+        else:
+            rectangle.resize_from_corner(self._shape_action[1], point)
+        self.document.update_rectangle(self.selected_rectangle, rectangle)
+        self.update_status()
+        self.schedule_render()
+
     def undo(self):
         self.release()
         self.document.undo()
+        self.selected_rectangle = None
         self.update_status()
         self.schedule_render()
 
     def redo(self):
         self.release()
         self.document.redo()
+        self.selected_rectangle = None
         self.update_status()
         self.schedule_render()
 
     def clear(self):
         self.release()
         self.document.clear()
+        self.selected_rectangle = None
         self.update_status()
         self.schedule_render()
 
@@ -367,6 +659,7 @@ class MaskEditor:
             self.page_choice.current(self.index)
             return
         self.document, self.index = document, index
+        self.selected_rectangle = None
         self.hide_cursor()
         self.fit()
         self.update_status()
@@ -456,6 +749,7 @@ class MaskEditor:
         bottom = min(self.document.image.height, math.ceil(self.canvas.canvasy(self.canvas.winfo_height()) / self.scale))
         self.update_cursor()
         if right <= left or bottom <= top:
+            self.render_shapes()
             return
         preview = self.document.preview((left, top, right, bottom))
         size = (max(1, round((right-left)*self.scale)), max(1, round((bottom-top)*self.scale)))
@@ -463,8 +757,32 @@ class MaskEditor:
         self._photo = ImageTk.PhotoImage(preview, master=self.root)
         self.canvas.coords(self._image_item, left*self.scale, top*self.scale)
         self.canvas.itemconfigure(self._image_item, image=self._photo)
+        self.render_shapes()
         self.canvas.tag_raise(self._cursor_halo)
         self.canvas.tag_raise(self._cursor_item)
+
+    def render_shapes(self):
+        self.canvas.delete("rectangle-ui")
+        if self.tool.get() != "rectangle":
+            return
+        for index, rectangle in enumerate(self.document.rectangles):
+            corners = rectangle.corners()
+            scaled = [(x * self.scale, y * self.scale) for x, y in corners]
+            self.canvas.create_polygon(*scaled, fill="", outline="#39d8ed",
+                                       width=2 if index == self.selected_rectangle else 1,
+                                       tags="rectangle-ui")
+            if index != self.selected_rectangle:
+                continue
+            rotation, anchor = self.rotation_handle(rectangle)
+            rx, ry = rotation[0] * self.scale, rotation[1] * self.scale
+            self.canvas.create_line(anchor[0] * self.scale, anchor[1] * self.scale,
+                                    rx, ry, fill="#39d8ed", width=2,
+                                    tags="rectangle-ui")
+            self.canvas.create_oval(rx - 6, ry - 6, rx + 6, ry + 6,
+                                    fill="#39d8ed", outline="black", tags="rectangle-ui")
+            for x, y in scaled:
+                self.canvas.create_rectangle(x - 6, y - 6, x + 6, y + 6,
+                                             fill="white", outline="black", tags="rectangle-ui")
 
 
 def launch_editor(image_dir, mask_dir):
