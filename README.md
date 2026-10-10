@@ -43,6 +43,11 @@ contains the actual rotated rectangle pixels, with no outline or handles. A
 other tools can use the PNG alone. Brush strokes and rectangles are combined in
 the saved mask. The `[` and `]` keys rotate the selected rectangle by 15 degrees
 when its circle is hard to reach.
+Press **Ctrl+C** to copy the selected rectangle and **Ctrl+V** to paste an
+editable duplicate with the same width, height, and rotation. Pasting on the
+same image offsets the duplicate by 16 pixels so it is visible; pasting on a
+different page keeps its source coordinates. You can move the pasted rectangle
+before saving.
 
 ## Use from Python
 

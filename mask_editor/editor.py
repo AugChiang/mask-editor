@@ -301,6 +301,9 @@ class MaskEditor:
         self._shape_start = None
         self._shape_original = None
         self._rotation_offset = 0
+        self._copied_rectangle = None
+        self._copied_from_image = None
+        self._paste_count = 0
         root.title("Mask editor")
         root.geometry("1100x820")
         root.minsize(720, 480)
@@ -386,6 +389,8 @@ class MaskEditor:
         root.bind("<Delete>", lambda event: self.shortcut(self.delete_rectangle))
         root.bind("<bracketleft>", lambda event: self.shortcut(lambda: self.rotate_selected(-15)))
         root.bind("<bracketright>", lambda event: self.shortcut(lambda: self.rotate_selected(15)))
+        root.bind("<Control-c>", lambda event: "break" if self.copy_rectangle() else None)
+        root.bind("<Control-v>", lambda event: "break" if self.paste_rectangle() else None)
         self.status = tk.StringVar()
         ttk.Label(root, textvariable=self.status, padding=8).pack(fill="x")
         self.update_status()
@@ -518,6 +523,37 @@ class MaskEditor:
         self.selected_rectangle = None
         self.update_status()
         self.schedule_render()
+
+    def copy_rectangle(self):
+        self.release()
+        index = self.selected_rectangle
+        if (self.tool.get() != "rectangle" or index is None
+                or index >= len(self.document.rectangles)):
+            return False
+        self._copied_rectangle = replace(self.document.rectangles[index])
+        self._copied_from_image = self.document.image_path
+        self._paste_count = 0
+        self.update_status("Rectangle copied. Press Ctrl+V to paste it.")
+        return True
+
+    def paste_rectangle(self):
+        self.release()
+        if self._copied_rectangle is None:
+            return False
+        rectangle = replace(self._copied_rectangle)
+        if self.document.image_path == self._copied_from_image:
+            self._paste_count += 1
+            rectangle.cx += 16 * self._paste_count
+            rectangle.cy += 16 * self._paste_count
+        rectangle.cx = min(max(rectangle.cx, 0), self.document.image.width - 1)
+        rectangle.cy = min(max(rectangle.cy, 0), self.document.image.height - 1)
+        self.selected_rectangle = self.document.add_rectangle(rectangle)
+        self.document.end_stroke()
+        self.tool.set("rectangle")
+        self.update_cursor()
+        self.update_status("Rectangle pasted. Drag it to position it.")
+        self.schedule_render()
+        return True
 
     def rotate_selected(self, degrees):
         self.release()

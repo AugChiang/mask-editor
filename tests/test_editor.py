@@ -173,6 +173,53 @@ class EditorTests(unittest.TestCase):
         editor.release()
         self.assertAlmostEqual(editor.document.rectangles[0].angle, 90)
 
+    def test_copy_paste_uses_adjusted_geometry_and_works_across_pages(self):
+        Image.new("RGB", (100, 100), "white").save(self.image_path)
+
+        class Tool:
+            value = "rectangle"
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        editor = MaskEditor.__new__(MaskEditor)
+        editor.document = MaskDocument(self.image_path, self.mask_path)
+        editor.document.add_rectangle(Rectangle(30, 30, 20, 10, 30))
+        editor.document.end_stroke()
+        editor.tool = Tool()
+        editor.selected_rectangle = 0
+        editor._shape_action = None
+        editor._last_point = None
+        editor._copied_rectangle = None
+        editor._copied_from_image = None
+        editor._paste_count = 0
+        editor.update_status = lambda message=None: None
+        editor.update_cursor = lambda: None
+        editor.schedule_render = lambda: None
+
+        self.assertTrue(editor.copy_rectangle())
+        editor.document.update_rectangle(0, Rectangle(30, 30, 25, 15, 45))
+        editor.document.end_stroke()
+        self.assertTrue(editor.paste_rectangle())
+        pasted = editor.document.rectangles[1]
+        self.assertEqual((pasted.cx, pasted.cy, pasted.width, pasted.height, pasted.angle),
+                         (46, 46, 20, 10, 30))
+        self.assertEqual(editor.selected_rectangle, 1)
+        editor.document.undo()
+        self.assertEqual(len(editor.document.rectangles), 1)
+
+        other_image = self.images / "other.png"
+        Image.new("RGB", (100, 100), "white").save(other_image)
+        editor.document = MaskDocument(other_image, self.masks / "other.png")
+        editor.selected_rectangle = None
+        self.assertTrue(editor.paste_rectangle())
+        other = editor.document.rectangles[0]
+        self.assertEqual((other.cx, other.cy, other.width, other.height, other.angle),
+                         (30, 30, 20, 10, 30))
+
 
 if __name__ == "__main__":
     unittest.main()

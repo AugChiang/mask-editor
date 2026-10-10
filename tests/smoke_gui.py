@@ -49,11 +49,20 @@ def main():
             rectangle = editor.document.rectangles[0]
             stroke(handle, (rectangle.cx + 30, rectangle.cy))
             assert abs(editor.document.rectangles[0].angle - 90) < 2
+            editor.canvas.focus_set()
+            editor.canvas.event_generate("<Control-c>")
+            editor.canvas.event_generate("<Control-v>")
+            root.update()
+            assert len(editor.document.rectangles) == 2
+            original, pasted = editor.document.rectangles
+            assert (pasted.width, pasted.height, pasted.angle) == (
+                original.width, original.height, original.angle)
+            assert editor.selected_rectangle == 1
             editor.render()
             assert editor.canvas.find_withtag("rectangle-ui")
             editor.save()
             assert (masks / "page.png").is_file()
-            assert len(MaskDocument(image_path, masks / "page.png").rectangles) == 1
+            assert len(MaskDocument(image_path, masks / "page.png").rectangles) == 2
         finally:
             root.destroy()
     print("Rectangle GUI smoke passed")
