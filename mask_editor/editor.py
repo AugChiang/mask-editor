@@ -3,6 +3,7 @@
 from collections import deque
 from dataclasses import asdict, dataclass, replace
 import base64
+import binascii
 import hashlib
 import io
 import json
@@ -10,7 +11,7 @@ import math
 from pathlib import Path
 import uuid
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageOps
 
 
 OVERLAY_COLOR = (255, 64, 160)
@@ -101,6 +102,7 @@ class MaskDocument:
         with Image.open(self.image_path) as image:
             self.image = ImageOps.exif_transpose(image).convert("RGB")
         self.rectangles = []
+        self._erase_mask = Image.new("L", self.image.size, 0)
         if self.mask_path.exists():
             with Image.open(self.mask_path) as mask:
                 if mask.size != self.image.size:
@@ -118,15 +120,18 @@ class MaskDocument:
         self._stroke_before = None
 
     def _snapshot(self):
-        buffer = io.BytesIO()
-        self._base_mask.save(buffer, format="PNG", compress_level=1)
-        return buffer.getvalue(), tuple((r.cx, r.cy, r.width, r.height, r.angle)
-                                      for r in self.rectangles)
+        base_buffer, erase_buffer = io.BytesIO(), io.BytesIO()
+        self._base_mask.save(base_buffer, format="PNG", compress_level=1)
+        self._erase_mask.save(erase_buffer, format="PNG", compress_level=1)
+        return (base_buffer.getvalue(), erase_buffer.getvalue(),
+                tuple((r.cx, r.cy, r.width, r.height, r.angle) for r in self.rectangles))
 
     def _restore(self, snapshot):
-        mask_png, rectangles = snapshot
-        with Image.open(io.BytesIO(mask_png)) as mask:
+        base_png, erase_png, rectangles = snapshot
+        with Image.open(io.BytesIO(base_png)) as mask:
             self._base_mask = mask.copy()
+        with Image.open(io.BytesIO(erase_png)) as mask:
+            self._erase_mask = mask.copy()
         self.rectangles = [Rectangle(*values) for values in rectangles]
         self._recompose()
         self.dirty = snapshot != self._saved
@@ -134,7 +139,8 @@ class MaskDocument:
     def _remember(self, history, snapshot):
         history.append(snapshot)
         while (len(history) > self.HISTORY_LIMIT
-               or sum(len(item[0]) + 40 * len(item[1]) for item in history) > self.HISTORY_BYTES):
+               or sum(len(item[0]) + len(item[1]) + 40 * len(item[2])
+                      for item in history) > self.HISTORY_BYTES):
             history.popleft()
 
     @property
@@ -146,6 +152,8 @@ class MaskDocument:
         draw = ImageDraw.Draw(self.mask)
         for rectangle in self.rectangles:
             draw.polygon(rectangle.corners(), fill=255)
+        if self._erase_mask.getbbox():
+            self.mask = ImageChops.subtract(self.mask, self._erase_mask)
 
     def _load_shapes(self):
         if not self.metadata_path.is_file():
@@ -153,7 +161,7 @@ class MaskDocument:
         original_mask = self._base_mask.copy()
         try:
             data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-            if data["version"] != 1:
+            if data["version"] not in (1, 2):
                 return
             if data["mask_sha256"] != hashlib.sha256(self._base_mask.tobytes()).hexdigest():
                 return  # The PNG was edited outside this editor; keep that PNG authoritative.
@@ -163,12 +171,21 @@ class MaskDocument:
                 rectangles = [Rectangle(**values) for values in data["rectangles"]]
                 self._base_mask = base.point(lambda value: 255 if value >= 128 else 0)
                 self.rectangles = rectangles
+            if data["version"] == 2:
+                with Image.open(io.BytesIO(base64.b64decode(data["erase_png"], validate=True))) as erased:
+                    if erased.size != self.image.size or erased.mode != "L":
+                        self._base_mask = original_mask
+                        self.rectangles = []
+                        return
+                    self._erase_mask = erased.point(lambda value: 255 if value >= 128 else 0)
             self._recompose()
             if hashlib.sha256(self.mask.tobytes()).hexdigest() != data["mask_sha256"]:
                 self._base_mask = original_mask
+                self._erase_mask.paste(0, (0, 0, *self._erase_mask.size))
                 self.rectangles = []
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, binascii.Error):
             self._base_mask = original_mask
+            self._erase_mask.paste(0, (0, 0, *self._erase_mask.size))
             self.rectangles = []
 
     def begin_stroke(self):
@@ -178,17 +195,29 @@ class MaskDocument:
     def brush(self, start, end, diameter, erase=False):
         diameter = max(1, int(diameter))
         self.begin_stroke()
-        value = 0 if erase else 255
-        draw = ImageDraw.Draw(self._base_mask)
         points = [(math.floor(x), math.floor(y)) for x, y in (start, end)]
-        draw.line(points, fill=value, width=diameter)
-        for x, y in points:
-            if diameter == 1:
-                draw.point((x, y), fill=value)
-            else:
-                left = x - diameter // 2
-                top = y - diameter // 2
-                draw.ellipse((left, top, left + diameter - 1, top + diameter - 1), fill=value)
+
+        def stroke(target, value):
+            draw = ImageDraw.Draw(target)
+            draw.line(points, fill=value, width=diameter)
+            for x, y in points:
+                if diameter == 1:
+                    draw.point((x, y), fill=value)
+                else:
+                    left = x - diameter // 2
+                    top = y - diameter // 2
+                    draw.ellipse((left, top, left + diameter - 1, top + diameter - 1), fill=value)
+
+        if erase and self.rectangles:
+            stroke_mask = Image.new("L", self.image.size, 0)
+            stroke(stroke_mask, 255)
+            # Only cut pixels already selected. An erase gesture on empty image
+            # must not hide a rectangle added there later.
+            affected = ImageChops.multiply(stroke_mask, self.mask)
+            self._erase_mask = ImageChops.lighter(self._erase_mask, affected)
+        else:
+            stroke(self._erase_mask, 0)
+        stroke(self._base_mask, 0 if erase else 255)
         self._recompose()
         self.dirty = True
 
@@ -208,6 +237,8 @@ class MaskDocument:
     def remove_rectangle(self, index):
         self.begin_stroke()
         del self.rectangles[index]
+        if not self.rectangles:
+            self._erase_mask.paste(0, (0, 0, *self._erase_mask.size))
         self._recompose()
         self.end_stroke()
 
@@ -236,6 +267,7 @@ class MaskDocument:
     def clear(self):
         self.begin_stroke()
         self._base_mask.paste(0, (0, 0, *self._base_mask.size))
+        self._erase_mask.paste(0, (0, 0, *self._erase_mask.size))
         self.rectangles.clear()
         self._recompose()
         self.end_stroke()
@@ -250,12 +282,14 @@ class MaskDocument:
         finally:
             if temporary.exists():
                 temporary.unlink()
-        if self.rectangles:
-            buffer = io.BytesIO()
-            self._base_mask.save(buffer, format="PNG")
-            data = {"version": 1,
+        if self.rectangles or self._erase_mask.getbbox():
+            base_buffer, erase_buffer = io.BytesIO(), io.BytesIO()
+            self._base_mask.save(base_buffer, format="PNG")
+            self._erase_mask.save(erase_buffer, format="PNG")
+            data = {"version": 2,
                     "mask_sha256": hashlib.sha256(self.mask.tobytes()).hexdigest(),
-                    "base_png": base64.b64encode(buffer.getvalue()).decode("ascii"),
+                    "base_png": base64.b64encode(base_buffer.getvalue()).decode("ascii"),
+                    "erase_png": base64.b64encode(erase_buffer.getvalue()).decode("ascii"),
                     "rectangles": [asdict(rectangle) for rectangle in self.rectangles]}
             metadata_temp = self.metadata_path.with_name(
                 f".{self.metadata_path.name}.{uuid.uuid4().hex}.tmp")

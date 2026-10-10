@@ -33,6 +33,9 @@ Paint or erase with the left mouse button, or erase with the right mouse button.
 Use the brush slider, Undo/Redo, Clear mask, zoom controls, scrollbars, and middle
 mouse dragging to navigate. Ctrl+S saves, Ctrl+Z undoes, and Ctrl+Y redoes. The
 editor asks about unsaved changes when changing pages or closing.
+The **Erase** brush and right-button dragging also remove parts of rectangle masks.
+Switch back to **Paint** to restore erased pixels. Erased areas remain editable
+after saving and reopening; they are kept with the rectangle data in the sidecar.
 
 Select **Rectangle** and drag on the image to draw a masked rectangle. Drag inside
 it to move it, drag a corner to change its width and height, or drag the circle

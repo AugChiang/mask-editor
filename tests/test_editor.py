@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import json
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -109,6 +110,63 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(reopened.mask.getextrema(), (0, 0))
         reopened.save()
         self.assertFalse(reopened.metadata_path.exists())
+
+    def test_erase_cuts_rectangle_mask_and_survives_undo_save_and_reopen(self):
+        document = MaskDocument(self.image_path, self.mask_path)
+        rectangle = Rectangle(12, 10, 16, 12)
+        document.add_rectangle(rectangle)
+        document.end_stroke()
+        document.brush((12, 10), (12, 10), 3, erase=True)
+        document.end_stroke()
+        self.assertEqual(document.mask.getpixel((12, 10)), 0)
+        self.assertEqual(document.mask.getpixel((6, 10)), 255)
+        self.assertEqual(document.preview().getpixel((12, 10)), (255, 255, 255))
+        document.undo()
+        self.assertEqual(document.mask.getpixel((12, 10)), 255)
+        document.redo()
+        self.assertEqual(document.mask.getpixel((12, 10)), 0)
+        document.brush((12, 10), (12, 10), 3)
+        document.end_stroke()
+        self.assertEqual(document.mask.getpixel((12, 10)), 255)
+        document.undo()
+        self.assertEqual(document.mask.getpixel((12, 10)), 0)
+        document.save()
+
+        with Image.open(self.mask_path) as saved:
+            self.assertEqual(set(saved.tobytes()), {0, 255})
+            self.assertEqual(saved.getpixel((12, 10)), 0)
+        metadata = json.loads(document.metadata_path.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["version"], 2)
+        reopened = MaskDocument(self.image_path, self.mask_path)
+        self.assertEqual(len(reopened.rectangles), 1)
+        self.assertEqual(reopened.mask.getpixel((12, 10)), 0)
+        reopened.remove_rectangle(0)
+        reopened.add_rectangle(rectangle)
+        reopened.end_stroke()
+        self.assertEqual(reopened.mask.getpixel((12, 10)), 255)
+
+    def test_version_one_rectangle_metadata_still_loads(self):
+        document = MaskDocument(self.image_path, self.mask_path)
+        document.add_rectangle(Rectangle(12, 10, 8, 6, 30))
+        document.save()
+        metadata = json.loads(document.metadata_path.read_text(encoding="utf-8"))
+        metadata["version"] = 1
+        del metadata["erase_png"]
+        document.metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        reopened = MaskDocument(self.image_path, self.mask_path)
+        self.assertEqual(len(reopened.rectangles), 1)
+        self.assertEqual(reopened.rectangles[0].angle, 30)
+        self.assertEqual(reopened.mask.tobytes(), document.mask.tobytes())
+
+    def test_erasing_empty_image_does_not_hide_a_later_rectangle(self):
+        document = MaskDocument(self.image_path, self.mask_path)
+        document.add_rectangle(Rectangle(12, 10, 8, 6))
+        document.end_stroke()
+        document.brush((2, 2), (2, 2), 3, erase=True)
+        document.end_stroke()
+        document.add_rectangle(Rectangle(2, 2, 4, 4))
+        document.end_stroke()
+        self.assertEqual(document.mask.getpixel((2, 2)), 255)
 
     def test_corner_resize_keeps_opposite_corner_and_rotation_changes_coverage(self):
         rectangle = Rectangle(12, 10, 8, 4, 30)

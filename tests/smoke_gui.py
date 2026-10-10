@@ -58,11 +58,19 @@ def main():
             assert (pasted.width, pasted.height, pasted.angle) == (
                 original.width, original.height, original.angle)
             assert editor.selected_rectangle == 1
+            editor.tool.set("erase")
+            editor.tool_changed()
+            editor.brush_slider.set(5)
+            erased = (round(original.cx), round(original.cy))
+            stroke(erased, erased)
+            assert editor.document.mask.getpixel(erased) == 0
+            assert editor.document.mask.getbbox()
             editor.render()
-            assert editor.canvas.find_withtag("rectangle-ui")
             editor.save()
             assert (masks / "page.png").is_file()
-            assert len(MaskDocument(image_path, masks / "page.png").rectangles) == 2
+            reopened = MaskDocument(image_path, masks / "page.png")
+            assert len(reopened.rectangles) == 2
+            assert reopened.mask.getpixel(erased) == 0
         finally:
             root.destroy()
     print("Rectangle GUI smoke passed")
